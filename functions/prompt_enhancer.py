@@ -1,8 +1,8 @@
 """
 title: Production Prompt Enhancer
 author: bezz
-version: 4.0.0
-description: Intent-aware LLM-based filter that enhances user prompts for better responses. Features per-user overrides, TTL-aware caching with full-config keys, request coalescing, config-driven intents, enhancement style modes, and smart skip logic.
+version: 5.0.0
+description: Intent-aware LLM-based filter that enhances user prompts for better responses. Features adaptive style picking, optional self-critique pass, dynamic intent exemplars, multimodal/tool/output-format awareness, per-user overrides, TTL-aware caching with full-config keys, request coalescing, config-driven intents, and smart skip logic.
 required_open_webui_version: 0.9.1
 """
 
@@ -238,6 +238,123 @@ def _is_code_only(text: str) -> bool:
         return False
     non_code = total_len - code_len
     return non_code < 40 and (code_len / total_len) > 0.85
+
+
+# ---------------------------------------------------------------------------
+# Adaptive style scoring
+# ---------------------------------------------------------------------------
+
+_VAGUE_WORDS_RE = re.compile(
+    r"\b(something|anything|stuff|things?|maybe|kind of|sort of|whatever)\b",
+    re.IGNORECASE,
+)
+_CONSTRAINT_WORDS_RE = re.compile(
+    r"\b(format|length|words?|chars?|return|must|should|do not|don'?t|"
+    r"only|exactly|at most|at least|within|under|over|step[- ]by[- ]step)\b",
+    re.IGNORECASE,
+)
+_STRUCTURE_MARKER_RE = re.compile(
+    r"(^\s*#{1,3}\s|^\s*[-*]\s|^\s*\d+\.\s|```)",
+    re.MULTILINE,
+)
+
+
+def _score_prompt(text: str) -> dict[str, Any]:
+    words = text.split()
+    word_count = len(words)
+    return {
+        "word_count": word_count,
+        "vague_hits": len(_VAGUE_WORDS_RE.findall(text)),
+        "constraint_hits": len(_CONSTRAINT_WORDS_RE.findall(text)),
+        "has_structure": bool(_STRUCTURE_MARKER_RE.search(text)),
+        "question_marks": text.count("?"),
+    }
+
+
+def _pick_style(score: dict[str, Any]) -> str:
+    word_count = score["word_count"]
+    constraints = score["constraint_hits"]
+    vague = score["vague_hits"]
+    structured = score["has_structure"]
+
+    # Already-clear prompts: short, low-vagueness, has explicit constraints
+    # and/or structural markers — keep changes minimal.
+    if structured and constraints >= 1 and vague == 0:
+        return "concise"
+    if word_count <= 25 and constraints >= 2 and vague == 0:
+        return "concise"
+
+    # Very short and/or vague prompts benefit from a thorough expansion.
+    if word_count <= 10 or vague >= 2:
+        return "detailed"
+    if word_count <= 20 and constraints == 0 and vague >= 1:
+        return "detailed"
+
+    return "standard"
+
+
+# ---------------------------------------------------------------------------
+# Output format detection
+# ---------------------------------------------------------------------------
+
+# Ordered: more specific patterns first.
+_FORMAT_PATTERNS: list[tuple[str, re.Pattern]] = [
+    (
+        "markdown-table",
+        re.compile(r"\b(markdown\s+table|as\s+(?:a\s+)?(?:md|markdown)\s+table)\b", re.IGNORECASE),
+    ),
+    (
+        "json",
+        re.compile(r"\b(?:as|in|return(?:ed)?(?:\s+as)?|output(?:\s+as)?)\s+json\b", re.IGNORECASE),
+    ),
+    (
+        "yaml",
+        re.compile(r"\b(?:as|in|return(?:ed)?(?:\s+as)?|output(?:\s+as)?)\s+yaml\b", re.IGNORECASE),
+    ),
+    (
+        "csv",
+        re.compile(r"\b(?:as|in|return(?:ed)?(?:\s+as)?|output(?:\s+as)?)\s+csv\b", re.IGNORECASE),
+    ),
+    (
+        "code-only",
+        re.compile(r"\b(code\s+only|just\s+(?:the\s+)?code|only\s+(?:the\s+)?code)\b", re.IGNORECASE),
+    ),
+    (
+        "bullets",
+        re.compile(r"\b(bullet\s+points?|as\s+bullets|in\s+bullets)\b", re.IGNORECASE),
+    ),
+]
+
+
+def _detect_output_format(text: str) -> Optional[str]:
+    for name, pat in _FORMAT_PATTERNS:
+        if pat.search(text):
+            return name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Multimodal hint — count image parts in the last user message
+# ---------------------------------------------------------------------------
+
+
+def _count_image_parts(messages: list[dict]) -> int:
+    if not messages:
+        return 0
+    last = messages[-1]
+    if last.get("role") != "user":
+        return 0
+    content = last.get("content")
+    if not isinstance(content, list):
+        return 0
+    count = 0
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type", "")
+        if isinstance(ptype, str) and ptype.startswith("image"):
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +647,93 @@ def _compile_intent_defs(defs: dict[str, dict[str, Any]]) -> dict[str, dict[str,
 COMPILED_INTENTS: dict[str, dict[str, Any]] = _compile_intent_defs(INTENT_DEFS)
 
 
+# Curated (original -> enhanced) exemplars by intent. Used when
+# `dynamic_examples` is enabled to inject a single small examples block into
+# the system prompt for the detected intent. Keep these short — they live in
+# every enhancement call's system prompt when triggered.
+INTENT_EXEMPLARS: dict[str, list[tuple[str, str]]] = {
+    "debugging": [
+        (
+            "fix this TypeError when I run my script",
+            "Diagnose the TypeError. Quote the exact failing line and traceback "
+            "frame, identify the root cause (e.g. wrong type passed, None where "
+            "an object was expected), propose the corrected code in a fenced "
+            "block with the language tag, explain why the fix works, and list "
+            "two ways to prevent the same class of bug.",
+        ),
+    ],
+    "coding": [
+        (
+            "write a script to dedupe a list",
+            "Write a Python 3 function `dedupe(items: Iterable[T]) -> list[T]` "
+            "that preserves first-seen order. Handle non-hashable elements by "
+            "falling back to an O(n^2) equality scan with a clear comment. "
+            "Include type hints, a docstring, and three pytest cases covering "
+            "ints, strings, and dicts.",
+        ),
+    ],
+    "summarization": [
+        (
+            "summarize this article",
+            "Summarize the article in two layers: (1) a single-sentence TL;DR; "
+            "(2) 3–5 bulleted key points in the article's own order. Stay "
+            "strictly faithful to the source — no added opinions or context. "
+            "Keep the total summary under 25% of the original length.",
+        ),
+    ],
+    "comparison": [
+        (
+            "compare postgres and mysql",
+            "Compare PostgreSQL and MySQL for a mid-sized web application. "
+            "Provide a markdown table on: SQL feature coverage, JSON/document "
+            "support, replication, extensibility, and ecosystem maturity. "
+            "Follow the table with two short scenario-based recommendations "
+            "(read-heavy analytics vs. high-write OLTP).",
+        ),
+    ],
+    "translation": [
+        (
+            "translate this to french",
+            "Translate the following text to French. Prefer natural, fluent "
+            "phrasing over literal word-for-word. Match the original register "
+            "(formal vs. informal). For any idioms or culturally-bound terms, "
+            "add a brief translator's note in square brackets.",
+        ),
+    ],
+    "analysis": [
+        (
+            "analyze this code",
+            "Analyze the code along four dimensions: correctness (any bugs or "
+            "edge cases missed), readability (naming, structure, comments), "
+            "performance (complexity hotspots), and maintainability. For each "
+            "dimension, cite specific line ranges and rate severity (low/med/"
+            "high). End with the top 3 actionable improvements.",
+        ),
+    ],
+    "explanation": [
+        (
+            "explain how DNS works",
+            "Explain how DNS works for a developer comfortable with HTTP but "
+            "new to networking internals. Start with an intuitive overview of "
+            "the resolution flow when a user opens a URL, then cover recursive "
+            "resolvers, root/TLD/authoritative servers, and TTL-based caching. "
+            "Use a concrete example resolving `www.example.com` end-to-end and "
+            "define jargon on first use.",
+        ),
+    ],
+    "planning": [
+        (
+            "plan a project to migrate to k8s",
+            "Produce a Kubernetes migration plan as numbered phases, each with "
+            "concrete deliverables, effort estimate (S/M/L), prerequisites, "
+            "and rollback strategy. Cover: containerization, observability, "
+            "ingress/networking, secrets management, and CI/CD. Highlight "
+            "risks and milestones, and explicitly mark scope boundaries.",
+        ),
+    ],
+}
+
+
 # Memoized compilation of admin-supplied custom intents (keyed by raw string).
 _custom_intent_cache: "dict[str, dict[str, dict[str, Any]]]" = {}
 
@@ -688,10 +892,13 @@ class EnhancementContext:
     model: str = ""
     temperature: float = 0.7
     user_id: str = ""
+    self_critique: bool = False
+    dynamic_examples: bool = False
+    context_facts: dict[str, Any] = field(default_factory=dict)
 
     def signature(self) -> str:
         payload = {
-            "v": 4,
+            "v": 5,
             "style": self.style,
             "intents": sorted(self.intents),
             "followup": self.is_followup,
@@ -701,6 +908,11 @@ class EnhancementContext:
             "model": self.model,
             "temp": round(float(self.temperature), 3),
             "uid": self.user_id,
+            "critique": self.self_critique,
+            "examples": self.dynamic_examples,
+            "facts": json.loads(
+                json.dumps(self.context_facts, sort_keys=True, default=str)
+            ),
         }
         return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
@@ -775,6 +987,51 @@ def _build_system_prompt(ctx: EnhancementContext, intents_catalog: dict[str, dic
                     hints.append(cfg["hint"])
             if hints:
                 parts.append("Intent-specific guidance:\n" + "\n\n".join(hints))
+
+        if ctx.dynamic_examples and ctx.intents:
+            exemplars: list[tuple[str, str]] = []
+            for intent in ctx.intents:
+                for pair in INTENT_EXEMPLARS.get(intent, []):
+                    exemplars.append(pair)
+                    if len(exemplars) >= 2:
+                        break
+                if len(exemplars) >= 2:
+                    break
+            if exemplars:
+                ex_lines = ["Examples for the detected intent(s):"]
+                for original, enhanced in exemplars:
+                    ex_lines.append(f'Original: "{original}"')
+                    ex_lines.append(f'Enhanced: "{enhanced}"')
+                    ex_lines.append("")
+                parts.append("\n".join(ex_lines).rstrip())
+
+        images = ctx.context_facts.get("images")
+        if isinstance(images, int) and images > 0:
+            noun = "image" if images == 1 else "images"
+            parts.append(
+                f"The user has attached {images} {noun}. The enhanced prompt "
+                "must explicitly leverage vision (e.g., 'examine the "
+                f"{noun}, then ...') and reference relevant image content "
+                "where it informs the answer."
+            )
+
+        tools = ctx.context_facts.get("tools")
+        if isinstance(tools, list) and tools:
+            tool_list = ", ".join(str(t) for t in tools)
+            parts.append(
+                f"Available tools: {tool_list}. The enhanced prompt must "
+                "direct the AI to call the appropriate tool(s) in the right "
+                "order (e.g., 'first call X to fetch Y, then ...'). Do not "
+                "assume tools that aren't listed."
+            )
+
+        fmt = ctx.context_facts.get("format")
+        if isinstance(fmt, str) and fmt:
+            parts.append(
+                f"Requested output format: {fmt}. The enhanced prompt must "
+                "require exactly this format, with a concrete schema, columns, "
+                "or keys where applicable."
+            )
 
     if ctx.additional_instructions.strip():
         parts.append(
@@ -1038,6 +1295,60 @@ class Filter:
             description="Retry once on transient LLM failure before falling back to original.",
         )
 
+        # --- Smarter quality ---
+        adaptive_style: bool = Field(
+            default=False,
+            description=(
+                "Auto-pick enhancement style (concise/standard/detailed) from "
+                "the prompt's vagueness, structure, and explicit constraints. "
+                "User overrides always win."
+            ),
+        )
+        self_critique: bool = Field(
+            default=False,
+            description=(
+                "After enhancing, run a second LLM pass to critique and "
+                "revise the result. Doubles enhancement latency; off by default."
+            ),
+        )
+        self_critique_temperature: float = Field(
+            default=0.3,
+            ge=0.0,
+            le=2.0,
+            description="Temperature for the self-critique/revise pass.",
+        )
+        dynamic_examples: bool = Field(
+            default=True,
+            description=(
+                "Inject 1–2 curated (original→enhanced) exemplars matching the "
+                "detected intent into the system prompt."
+            ),
+        )
+
+        # --- Context awareness ---
+        multimodal_aware: bool = Field(
+            default=True,
+            description=(
+                "When the user attaches images, instruct the enhancer to make "
+                "the enhanced prompt explicitly leverage vision."
+            ),
+        )
+        tool_directive: bool = Field(
+            default=True,
+            description=(
+                "When tools are available, instruct the enhancer to make the "
+                "enhanced prompt directively call them in the right order."
+            ),
+        )
+        auto_format: bool = Field(
+            default=True,
+            description=(
+                "Detect output-format cues in the original prompt (JSON, YAML, "
+                "CSV, markdown table, bullets, code-only) and require them in "
+                "the enhanced prompt."
+            ),
+        )
+
         # --- Prompt customization ---
         custom_system_prompt: str = Field(
             default="",
@@ -1105,17 +1416,61 @@ class Filter:
         await asyncio.sleep(1.0)
         return await self._call_llm(request, payload, user)
 
-    def _resolve_user_overrides(self, user_valves) -> tuple[str, bool]:
+    async def _critique_and_revise(
+        self,
+        original: str,
+        candidate: str,
+        request: Optional[Request],
+        user,
+        model: str,
+    ) -> str:
+        """One-shot critique+revise pass. Returns the candidate on any failure."""
+        system = (
+            "You are revising an enhanced prompt. Compare the candidate "
+            "against the user's original. If the candidate is faithful, "
+            "specific, and high-quality, return it unchanged. Otherwise "
+            "return a single revised prompt that fixes the issues — keeping "
+            "the user's intent, voice, and language.\n\n"
+            "Return ONLY the final prompt text. No headers, no commentary."
+        )
+        user_msg = (
+            f'Original prompt:\n"""{original}"""\n\n'
+            f'Candidate enhancement:\n"""{candidate}"""'
+        )
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            "stream": False,
+            "temperature": float(self.valves.self_critique_temperature),
+        }
+        try:
+            raw = await self._call_llm(request, payload, user)
+        except Exception:
+            return candidate
+        if not raw:
+            return candidate
+        cleaned = _clean_llm_output(raw).strip()
+        if not cleaned:
+            return candidate
+        return cleaned
+
+    def _resolve_user_overrides(self, user_valves) -> tuple[str, bool, bool]:
+        """Returns (style, show_embed, user_overrode_style)."""
         style = self.valves.enhancement_style
         show_embed = self.valves.show_enhanced_prompt
+        user_overrode_style = False
         if isinstance(user_valves, self.UserValves):
             if user_valves.enhancement_style in ("concise", "standard", "detailed"):
                 style = user_valves.enhancement_style
+                user_overrode_style = True
             if user_valves.show_enhanced_prompt is not None:
                 show_embed = user_valves.show_enhanced_prompt
         if style not in ("concise", "standard", "detailed"):
             style = "standard"
-        return style, show_embed
+        return style, show_embed, user_overrode_style
 
     def _should_skip(
         self, user_message: str, messages: list[dict], followup: bool
@@ -1170,7 +1525,20 @@ class Filter:
             return body
 
         well_structured = _is_well_structured(user_message)
-        style, show_embed = self._resolve_user_overrides(user_valves)
+        style, show_embed, user_overrode_style = self._resolve_user_overrides(
+            user_valves
+        )
+
+        # Adaptive style: only when the valve is on AND the user did not pick
+        # their own style. Skipped for follow-ups and well-structured prompts
+        # since those already use specialized system prompts.
+        if (
+            self.valves.adaptive_style
+            and not user_overrode_style
+            and not followup
+            and not well_structured
+        ):
+            style = _pick_style(_score_prompt(user_message))
 
         # --- Intent detection (built-ins + admin custom intents) ---
         intents_catalog = dict(COMPILED_INTENTS)
@@ -1187,6 +1555,21 @@ class Filter:
                 logger.info("Skipped: no model could be resolved")
             return body
 
+        # --- Context awareness facts ---
+        context_facts: dict[str, Any] = {}
+        if self.valves.multimodal_aware:
+            image_count = _count_image_parts(messages)
+            if image_count > 0:
+                context_facts["images"] = image_count
+        if self.valves.tool_directive:
+            tool_ids = body.get("tool_ids")
+            if isinstance(tool_ids, list) and tool_ids:
+                context_facts["tools"] = sorted(str(t) for t in tool_ids)
+        if self.valves.auto_format:
+            fmt = _detect_output_format(user_message)
+            if fmt:
+                context_facts["format"] = fmt
+
         ctx = EnhancementContext(
             style=style,
             intents=active_intents,
@@ -1197,6 +1580,9 @@ class Filter:
             model=model_to_use,
             temperature=self.valves.temperature,
             user_id=str(__user__.get("id", "")) if __user__ else "",
+            self_critique=self.valves.self_critique,
+            dynamic_examples=self.valves.dynamic_examples,
+            context_facts=context_facts,
         )
         signature = ctx.signature()
 
@@ -1275,6 +1661,16 @@ class Filter:
             cleaned = _clean_llm_output(raw)
             if not cleaned.strip():
                 return None
+            if self.valves.self_critique:
+                cleaned = await self._critique_and_revise(
+                    original=user_message,
+                    candidate=cleaned,
+                    request=__request__,
+                    user=user,
+                    model=model_to_use,
+                )
+                if not cleaned.strip():
+                    return None
             if len(cleaned) > self.valves.max_enhanced_length:
                 if self.valves.debug:
                     logger.warning(

@@ -1,4 +1,5 @@
 import asyncio
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -419,3 +420,361 @@ async def test_inlet_request_coalescing(pe, emitter, monkeypatch):
     assert calls["n"] == 1  # coalesced into a single LLM call
     assert r1["messages"][0]["content"] == "the single shared enhanced prompt result"
     assert r2["messages"][0]["content"] == "the single shared enhanced prompt result"
+
+
+# ---------------------------------------------------------------------------
+# Adaptive style scoring
+# ---------------------------------------------------------------------------
+
+
+def test_score_prompt_counts_signals(pe):
+    s = pe._score_prompt("Maybe write something about stuff?")
+    assert s["word_count"] == 5
+    assert s["vague_hits"] >= 2  # maybe, something, stuff
+    assert s["question_marks"] == 1
+
+
+def test_pick_style_short_vague_is_detailed(pe):
+    score = pe._score_prompt("explain stuff")
+    assert pe._pick_style(score) == "detailed"
+
+
+def test_pick_style_structured_with_constraints_is_concise(pe):
+    text = (
+        "# Task\nWrite a function. Must return JSON. Use exactly 3 keys: id, name, value.\n"
+        "- handle empty input\n- handle null\n- include type hints"
+    )
+    assert pe._pick_style(pe._score_prompt(text)) == "concise"
+
+
+def test_pick_style_mid_length_is_standard(pe):
+    text = (
+        "I'd like a thoughtful overview of how distributed consensus works in "
+        "modern databases, including Raft and Paxos at a high level."
+    )
+    assert pe._pick_style(pe._score_prompt(text)) == "standard"
+
+
+async def test_adaptive_style_applies_when_no_user_override(pe, emitter, monkeypatch):
+    f = pe.Filter()
+    f.valves.adaptive_style = True
+    captured: dict[str, Any] = {}
+
+    async def fake_call(self, request, payload, user):
+        captured["system"] = payload["messages"][0]["content"]
+        return "enhanced output text body here"
+
+    monkeypatch.setattr(pe.Filter, "_call_llm", fake_call)
+    await f.inlet(_body("explain something briefly"), emitter)
+    # short vague → detailed system style should kick in
+    assert "DETAILED" in captured["system"]
+
+
+async def test_adaptive_style_skipped_when_user_overrides(pe, emitter, monkeypatch):
+    f = pe.Filter()
+    f.valves.adaptive_style = True
+    captured: dict[str, Any] = {}
+
+    async def fake_call(self, request, payload, user):
+        captured["system"] = payload["messages"][0]["content"]
+        return "enhanced output text"
+
+    monkeypatch.setattr(pe.Filter, "_call_llm", fake_call)
+
+    # User explicitly picks "concise" → must win over adaptive's "detailed".
+    user = {"id": "u1", "valves": f.UserValves(enhancement_style="concise")}
+    body = _body("explain something briefly")
+    await f.inlet(body, emitter, __user__=user)
+    assert "CONCISE" in captured["system"]
+    assert "DETAILED" not in captured["system"]
+
+
+# ---------------------------------------------------------------------------
+# Output format detection
+# ---------------------------------------------------------------------------
+
+
+def test_detect_output_format_json(pe):
+    assert pe._detect_output_format("give me the answer as JSON please") == "json"
+    assert pe._detect_output_format("return in json with keys") == "json"
+
+
+def test_detect_output_format_markdown_table(pe):
+    assert (
+        pe._detect_output_format("compare them in a markdown table") == "markdown-table"
+    )
+
+
+def test_detect_output_format_yaml_csv_bullets(pe):
+    assert pe._detect_output_format("output as YAML") == "yaml"
+    assert pe._detect_output_format("return as CSV") == "csv"
+    assert pe._detect_output_format("give me bullet points") == "bullets"
+    assert pe._detect_output_format("code only please") == "code-only"
+
+
+def test_detect_output_format_none(pe):
+    assert pe._detect_output_format("just explain this concept clearly") is None
+
+
+# ---------------------------------------------------------------------------
+# Multimodal image counter
+# ---------------------------------------------------------------------------
+
+
+def test_count_image_parts_empty(pe):
+    assert pe._count_image_parts([]) == 0
+    assert pe._count_image_parts([{"role": "user", "content": "no images"}]) == 0
+
+
+def test_count_image_parts_counts_images(pe):
+    msgs = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look at these"},
+                {"type": "image_url", "image_url": {"url": "x"}},
+                {"type": "image_url", "image_url": {"url": "y"}},
+            ],
+        }
+    ]
+    assert pe._count_image_parts(msgs) == 2
+
+
+def test_count_image_parts_ignores_assistant(pe):
+    msgs = [
+        {
+            "role": "assistant",
+            "content": [{"type": "image_url", "image_url": {"url": "x"}}],
+        }
+    ]
+    assert pe._count_image_parts(msgs) == 0
+
+
+# ---------------------------------------------------------------------------
+# _build_system_prompt — exemplars + context-fact blocks
+# ---------------------------------------------------------------------------
+
+
+def test_build_system_prompt_injects_intent_exemplar(pe):
+    ctx = pe.EnhancementContext(
+        style="standard",
+        intents=["debugging"],
+        dynamic_examples=True,
+    )
+    out = pe._build_system_prompt(ctx, pe.COMPILED_INTENTS)
+    assert "Examples for the detected intent(s):" in out
+    # the curated debugging exemplar's "Quote the exact failing line" hint
+    assert "Quote the exact failing line" in out
+
+
+def test_build_system_prompt_no_exemplar_when_disabled(pe):
+    ctx = pe.EnhancementContext(
+        style="standard",
+        intents=["debugging"],
+        dynamic_examples=False,
+    )
+    out = pe._build_system_prompt(ctx, pe.COMPILED_INTENTS)
+    assert "Examples for the detected intent(s):" not in out
+
+
+def test_build_system_prompt_no_exemplar_with_custom_prompt(pe):
+    ctx = pe.EnhancementContext(
+        style="standard",
+        intents=["debugging"],
+        dynamic_examples=True,
+        custom_system_prompt="REPLACE EVERYTHING.",
+    )
+    out = pe._build_system_prompt(ctx, pe.COMPILED_INTENTS)
+    assert "Examples for the detected intent(s):" not in out
+    assert out.startswith("REPLACE EVERYTHING.")
+
+
+def test_build_system_prompt_multimodal_hint(pe):
+    ctx = pe.EnhancementContext(context_facts={"images": 2})
+    out = pe._build_system_prompt(ctx, pe.COMPILED_INTENTS)
+    assert "attached 2 images" in out
+    assert "leverage vision" in out
+
+
+def test_build_system_prompt_tool_directive(pe):
+    ctx = pe.EnhancementContext(context_facts={"tools": ["web_search", "code_run"]})
+    out = pe._build_system_prompt(ctx, pe.COMPILED_INTENTS)
+    assert "Available tools: web_search, code_run" in out
+    assert "call the appropriate tool" in out
+
+
+def test_build_system_prompt_format_hint(pe):
+    ctx = pe.EnhancementContext(context_facts={"format": "json"})
+    out = pe._build_system_prompt(ctx, pe.COMPILED_INTENTS)
+    assert "Requested output format: json" in out
+
+
+def test_build_system_prompt_facts_skipped_with_custom_prompt(pe):
+    ctx = pe.EnhancementContext(
+        custom_system_prompt="CUSTOM ONLY.",
+        context_facts={"images": 1, "tools": ["t"], "format": "yaml"},
+    )
+    out = pe._build_system_prompt(ctx, pe.COMPILED_INTENTS)
+    assert "attached" not in out
+    assert "Available tools" not in out
+    assert "Requested output format" not in out
+
+
+# ---------------------------------------------------------------------------
+# Cache signature isolation for new fields
+# ---------------------------------------------------------------------------
+
+
+def test_signature_isolates_self_critique(pe):
+    a = pe.EnhancementContext(style="standard", model="m", self_critique=False)
+    b = pe.EnhancementContext(style="standard", model="m", self_critique=True)
+    assert a.signature() != b.signature()
+
+
+def test_signature_isolates_dynamic_examples(pe):
+    a = pe.EnhancementContext(style="standard", model="m", dynamic_examples=False)
+    b = pe.EnhancementContext(style="standard", model="m", dynamic_examples=True)
+    assert a.signature() != b.signature()
+
+
+def test_signature_isolates_context_facts(pe):
+    a = pe.EnhancementContext(style="standard", model="m", context_facts={})
+    b = pe.EnhancementContext(
+        style="standard", model="m", context_facts={"images": 1}
+    )
+    c = pe.EnhancementContext(
+        style="standard", model="m", context_facts={"format": "json"}
+    )
+    assert a.signature() != b.signature()
+    assert a.signature() != c.signature()
+    assert b.signature() != c.signature()
+
+
+# ---------------------------------------------------------------------------
+# Multimodal / tool / format wiring through inlet
+# ---------------------------------------------------------------------------
+
+
+async def test_inlet_multimodal_hint_reaches_system_prompt(pe, emitter, monkeypatch):
+    f = pe.Filter()
+    captured: dict[str, Any] = {}
+
+    async def fake_call(self, request, payload, user):
+        captured["system"] = payload["messages"][0]["content"]
+        return "enhanced version of the request"
+
+    monkeypatch.setattr(pe.Filter, "_call_llm", fake_call)
+
+    body = {
+        "model": "test-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "explain what is happening here"},
+                    {"type": "image_url", "image_url": {"url": "x"}},
+                ],
+            }
+        ],
+    }
+    await f.inlet(body, emitter)
+    assert "attached 1 image" in captured["system"]
+    assert "leverage vision" in captured["system"]
+
+
+async def test_inlet_tool_directive_reaches_system_prompt(pe, emitter, monkeypatch):
+    f = pe.Filter()
+    captured: dict[str, Any] = {}
+
+    async def fake_call(self, request, payload, user):
+        captured["system"] = payload["messages"][0]["content"]
+        return "enhanced version of the request"
+
+    monkeypatch.setattr(pe.Filter, "_call_llm", fake_call)
+    body = _body("research recent llm benchmarks for me thoroughly")
+    body["tool_ids"] = ["web_search", "calculator"]
+    await f.inlet(body, emitter)
+    assert "Available tools: calculator, web_search" in captured["system"]
+
+
+async def test_inlet_auto_format_reaches_system_prompt(pe, emitter, monkeypatch):
+    f = pe.Filter()
+    captured: dict[str, Any] = {}
+
+    async def fake_call(self, request, payload, user):
+        captured["system"] = payload["messages"][0]["content"]
+        return "enhanced version of the request"
+
+    monkeypatch.setattr(pe.Filter, "_call_llm", fake_call)
+    await f.inlet(_body("list me three programming languages as JSON please"), emitter)
+    assert "Requested output format: json" in captured["system"]
+
+
+async def test_inlet_dynamic_examples_reaches_system_prompt(pe, emitter, monkeypatch):
+    f = pe.Filter()
+    captured: dict[str, Any] = {}
+
+    async def fake_call(self, request, payload, user):
+        captured["system"] = payload["messages"][0]["content"]
+        return "enhanced version of the request"
+
+    monkeypatch.setattr(pe.Filter, "_call_llm", fake_call)
+    # "debug ... TypeError" → debugging intent
+    await f.inlet(_body("debug this TypeError I keep getting in my code"), emitter)
+    assert "Examples for the detected intent(s):" in captured["system"]
+    assert "Quote the exact failing line" in captured["system"]
+
+
+# ---------------------------------------------------------------------------
+# Self-critique pass
+# ---------------------------------------------------------------------------
+
+
+async def test_self_critique_revises_candidate(pe, emitter, monkeypatch):
+    f = pe.Filter()
+    f.valves.self_critique = True
+    calls: list[str] = []
+
+    async def fake_call(self, request, payload, user):
+        # First call = enhancement, second = critique/revise.
+        if not calls:
+            calls.append("enhance")
+            return "first-pass enhanced text body content here"
+        calls.append("critique")
+        return "REVISED final prompt after self critique"
+
+    monkeypatch.setattr(pe.Filter, "_call_llm", fake_call)
+    out = await f.inlet(_body("explain how dns resolution works"), emitter)
+    assert calls == ["enhance", "critique"]
+    assert out["messages"][0]["content"] == "REVISED final prompt after self critique"
+
+
+async def test_self_critique_falls_back_when_empty(pe, emitter, monkeypatch):
+    f = pe.Filter()
+    f.valves.self_critique = True
+
+    async def fake_call(self, request, payload, user):
+        # Enhancement returns text, critique returns empty → keep candidate.
+        if "Candidate enhancement" in payload["messages"][1]["content"]:
+            return "   "
+        return "the original first-pass enhancement output here"
+
+    monkeypatch.setattr(pe.Filter, "_call_llm", fake_call)
+    out = await f.inlet(_body("explain how dns resolution works"), emitter)
+    assert (
+        out["messages"][0]["content"]
+        == "the original first-pass enhancement output here"
+    )
+
+
+async def test_self_critique_off_makes_single_call(pe, emitter, monkeypatch):
+    f = pe.Filter()
+    calls = {"n": 0}
+
+    async def fake_call(self, request, payload, user):
+        calls["n"] += 1
+        return "single-pass enhanced result text"
+
+    monkeypatch.setattr(pe.Filter, "_call_llm", fake_call)
+    await f.inlet(_body("explain how dns resolution works"), emitter)
+    assert calls["n"] == 1
